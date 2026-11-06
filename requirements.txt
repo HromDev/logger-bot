@@ -1,0 +1,2 @@
+disnake==2.12.2
+python-dotenv>=1.0,<2.0
