@@ -1,8 +1,10 @@
 import asyncio
 import datetime
+import io
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -218,6 +220,63 @@ CHANGE_LABELS = {
     "temporary": "Временное приглашение",
 }
 
+FLAG_LABELS = {
+    "create_instant_invite": "Создавать приглашения",
+    "kick_members": "Исключать участников",
+    "ban_members": "Банить участников",
+    "administrator": "Администратор",
+    "manage_channels": "Управлять каналами",
+    "manage_guild": "Управлять сервером",
+    "add_reactions": "Добавлять реакции",
+    "view_audit_log": "Просматривать журнал аудита",
+    "priority_speaker": "Приоритетный режим голоса",
+    "stream": "Видеотрансляция",
+    "view_channel": "Просматривать каналы",
+    "send_messages": "Отправлять сообщения",
+    "send_tts_messages": "Отправлять сообщения Text-to-Speech",
+    "manage_messages": "Управлять сообщениями",
+    "embed_links": "Встраивать ссылки",
+    "attach_files": "Прикреплять файлы",
+    "read_message_history": "Просматривать историю сообщений",
+    "mention_everyone": "Упоминать @everyone и @here",
+    "external_emojis": "Использовать внешние эмодзи",
+    "view_guild_insights": "Просматривать аналитику сервера",
+    "connect": "Подключаться к голосовым каналам",
+    "speak": "Говорить в голосовых каналах",
+    "mute_members": "Отключать микрофоны участников",
+    "deafen_members": "Отключать звук участникам",
+    "move_members": "Перемещать участников",
+    "use_voice_activation": "Использовать голосовую активацию",
+    "change_nickname": "Менять свой никнейм",
+    "manage_nicknames": "Управлять никнеймами",
+    "manage_roles": "Управлять ролями",
+    "manage_webhooks": "Управлять вебхуками",
+    "manage_guild_expressions": "Управлять эмодзи и стикерами",
+    "use_application_commands": "Использовать команды приложений",
+    "request_to_speak": "Запрашивать право выступить",
+    "manage_events": "Управлять событиями",
+    "manage_threads": "Управлять ветками",
+    "create_public_threads": "Создавать публичные ветки",
+    "create_private_threads": "Создавать приватные ветки",
+    "external_stickers": "Использовать внешние стикеры",
+    "send_messages_in_threads": "Отправлять сообщения в ветках",
+    "use_embedded_activities": "Запускать активности",
+    "moderate_members": "Выдавать тайм-аут участникам",
+    "view_creator_monetization_analytics": "Просматривать аналитику монетизации",
+    "use_soundboard": "Использовать звуковую панель",
+    "create_guild_expressions": "Создавать эмодзи и стикеры",
+    "create_events": "Создавать события",
+    "use_external_sounds": "Использовать внешние звуки",
+    "send_voice_messages": "Отправлять голосовые сообщения",
+    "send_polls": "Создавать опросы",
+    "use_external_apps": "Использовать внешние приложения",
+    "pin_messages": "Закреплять сообщения",
+    "bypass_slowmode": "Обходить медленный режим",
+    "pinned": "Закреплён",
+    "require_tag": "Требовать тег",
+    "hide_media_download_options": "Скрывать скачивание медиа",
+}
+
 
 @dataclass
 class PendingVoiceLog:
@@ -233,6 +292,13 @@ def _safe_text(value: Any, limit: int = 450) -> str:
         text = "—"
     elif isinstance(value, bool):
         text = "Да" if value else "Нет"
+    elif isinstance(value, disnake.PermissionOverwrite):
+        allow, deny = value.pair()
+        allowed = _format_flags(allow)
+        denied = _format_flags(deny)
+        text = f"Разрешено: {allowed}; запрещено: {denied}"
+    elif isinstance(value, disnake.flags.BaseFlags):
+        text = _format_flags(value)
     elif isinstance(value, (list, tuple, set)):
         text = ", ".join(_safe_text(item, 100) for item in value) or "—"
     else:
@@ -242,11 +308,43 @@ def _safe_text(value: Any, limit: int = 450) -> str:
         if mention and identifier is not None:
             safe_name = str(name or value).replace("`", "ˋ")
             text = f"{mention} (`{safe_name}` · `{identifier}`)"
+        elif isinstance(value, disnake.Object):
+            text = f"ID `{value.id}`"
         else:
             text = str(value).replace("`", "ˋ")
     text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _format_flags(value: disnake.flags.BaseFlags) -> str:
+    enabled = [
+        FLAG_LABELS.get(name, name.replace("_", " ").capitalize())
+        for name, is_enabled in value
+        if is_enabled
+    ]
+    return ", ".join(enabled) or "Нет"
+
+
+def _format_overwrites(value: Any) -> str:
+    if value is None:
+        return "—"
+    if not isinstance(value, (list, tuple)):
+        return _safe_text(value)
+    if not value:
+        return "—"
+
+    lines = []
+    for target, overwrite in value:
+        allow, deny = overwrite.pair()
+        lines.extend(
+            (
+                f"• {_safe_text(target, 150)}",
+                f"  Разрешено: {_format_flags(allow)}",
+                f"  Запрещено: {_format_flags(deny)}",
+            )
+        )
+    return "\n".join(lines)
 
 
 def _get_audit_target(entry: disnake.AuditLogEntry) -> Any:
@@ -271,22 +369,71 @@ def _build_log_components(
     details: list[str],
     log_key: str,
     application_emojis: dict[str, disnake.Emoji] | None = None,
-) -> list[ui.Component]:
+) -> tuple[list[ui.Component], str | None]:
     emoji_name = LOG_EMOJI_NAMES.get(log_key)
     emoji = application_emojis.get(emoji_name) if application_emojis and emoji_name else None
     icon = f"{emoji} " if emoji is not None else ""
-    components: list[ui.Component] = [
-        ui.TextDisplay(f"## {icon}**{_safe_text(title, 150)}**"),
-    ]
-    rows = [detail[:1000] for detail in details[:12]]
-    rows.append(f"**Сервер** · {_safe_text(guild.name, 150)} (`{guild.id}`)")
-    for index, row in enumerate(rows):
-        if index:
-            components.append(
-                ui.Separator(divider=True, spacing=disnake.SeparatorSpacing.small)
-            )
+    header = f"## {icon}**{_safe_text(title, 150)}**"
+    detail_rows: list[str] = []
+    timestamp = int(disnake.utils.utcnow().timestamp())
+    for detail in details:
+        timestamp_match = re.fullmatch(r"\*\*Время\*\* · <t:(\d+):F>", detail)
+        if timestamp_match:
+            timestamp = int(timestamp_match.group(1))
+            continue
+        detail_rows.append(detail)
+
+    formatted_time = datetime.datetime.fromtimestamp(timestamp).strftime(
+        "%d.%m.%Y - %H:%M"
+    )
+    footer = f"-# Сервер: **{_safe_text(guild.name, 150)}** · {formatted_time}"
+    full_text = (
+        f"{title}\nСервер: {guild.name} · {formatted_time}\n\n"
+        + "\n\n".join(detail_rows)
+    )
+    needs_attachment = (
+        len(detail_rows) > 12
+        or any(len(row) > 1000 for row in detail_rows)
+        or sum(map(len, detail_rows)) + max(len(detail_rows) - 1, 0) > 3500
+    )
+    if needs_attachment:
+        logger.warning(
+            "Audit log details exceed component limits for guild %s action %s; "
+            "full details will be attached as text",
+            guild.id,
+            log_key,
+        )
+
+    rows: list[str] = []
+    body_limit = 2500 if needs_attachment else 3500
+    body_length = 0
+    for detail in detail_rows[:12]:
+        row = detail[:1000]
+        separator_length = 1 if rows else 0
+        available = body_limit - body_length - separator_length
+        if len(row) > available:
+            if available > 0:
+                rows.append(row[: max(available - 1, 0)] + "…")
+            break
+        rows.append(row)
+        body_length += len(row) + separator_length
+
+    if needs_attachment:
+        rows.append("Полная запись приложена файлом `server-log-details.txt`.")
+
+    components: list[ui.Component] = [ui.TextDisplay(header)]
+    for row in rows:
+        components.append(
+            ui.Separator(divider=True, spacing=disnake.SeparatorSpacing.small)
+        )
         components.append(ui.TextDisplay(row))
-    return components
+    if needs_attachment:
+        components.append(ui.File(file="attachment://server-log-details.txt"))
+    components.append(
+        ui.Separator(divider=True, spacing=disnake.SeparatorSpacing.small)
+    )
+    components.append(ui.TextDisplay(footer))
+    return components, full_text if needs_attachment else None
 
 
 class ServerLogsCog(commands.Cog, name="Логи сервера"):
@@ -464,9 +611,16 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
                 if key == "roles":
                     continue
 
+                label = CHANGE_LABELS.get(key, key.replace("_", " ").capitalize())
+                if key == "overwrites":
+                    old = _format_overwrites(before.get(key))
+                    new = _format_overwrites(after.get(key))
+                    details.append(
+                        f"**{label}**\nДо:\n{old}\nПосле:\n{new}"
+                    )
+                    continue
                 old = _safe_text(before.get(key))
                 new = _safe_text(after.get(key))
-                label = CHANGE_LABELS.get(key, key.replace("_", " ").capitalize())
                 details.append(f"**{label}** · {old} → {new}")
 
         extra = entry.extra
@@ -962,7 +1116,7 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         emoji_name = LOG_EMOJI_NAMES.get(log_key)
         if emoji_name and emoji_name not in self._application_emojis:
             await self._refresh_application_emojis()
-        components = _build_log_components(
+        components, overflow_text = _build_log_components(
             change.member.guild, title, details, log_key, self._application_emojis
         )
         await self._send_components(
@@ -970,6 +1124,16 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
             components,
             log_key=log_key,
             context=f"voice log for member {change.member.id}",
+            files=(
+                [
+                    disnake.File(
+                        io.BytesIO(overflow_text.encode("utf-8")),
+                        filename="server-log-details.txt",
+                    )
+                ]
+                if overflow_text is not None
+                else None
+            ),
         )
 
     @commands.Cog.listener()
@@ -1140,6 +1304,7 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         *,
         log_key: str,
         context: str,
+        files: list[disnake.File] | None = None,
     ) -> None:
         channel, channel_id = await self._get_log_channel(log_key)
         if channel is None:
@@ -1148,6 +1313,7 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
             await channel.send(
                 components=[ui.Container(*components)],
                 allowed_mentions=disnake.AllowedMentions.none(),
+                files=files,
             )
         except disnake.Forbidden:
             logger.error(
@@ -1166,21 +1332,27 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         *,
         log_key: str = "default",
     ) -> None:
-        if len(details) > 12:
-            logger.warning(
-                "Audit log entry details were truncated for guild %s action %s",
-                guild.id,
-                title,
-            )
-
         emoji_name = LOG_EMOJI_NAMES.get(log_key)
         if emoji_name and emoji_name not in self._application_emojis:
             await self._refresh_application_emojis()
-        components = _build_log_components(
+        components, overflow_text = _build_log_components(
             guild, title, details, log_key, self._application_emojis
         )
         await self._send_components(
-            guild, components, log_key=log_key, context=f"server log '{title}'"
+            guild,
+            components,
+            log_key=log_key,
+            context=f"server log '{title}'",
+            files=(
+                [
+                    disnake.File(
+                        io.BytesIO(overflow_text.encode("utf-8")),
+                        filename="server-log-details.txt",
+                    )
+                ]
+                if overflow_text is not None
+                else None
+            ),
         )
 
 
