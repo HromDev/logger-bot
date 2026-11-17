@@ -13,3 +13,6 @@ htmlcov/
 .vscode/
 Thumbs.db
 .DS_Store
+
+# Message store (deleted/edited message content and attachments)
+data/

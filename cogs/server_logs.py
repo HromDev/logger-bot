@@ -10,11 +10,25 @@ from typing import Any
 
 import disnake
 from disnake import ui
-from disnake.ext import commands
+from disnake.ext import commands, tasks
+
+from cogs.message_store import (
+    MessageStore,
+    StoredAttachment,
+    StoredMessage,
+    safe_filename,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_DEFAULT", "0") or "0")
+MESSAGE_CACHE_DIR = os.getenv("MESSAGE_CACHE_DIR", "").strip() or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+)
+MESSAGE_CACHE_DAYS = float(os.getenv("MESSAGE_CACHE_DAYS", "14") or "14")
+MESSAGE_CACHE_MAX_FILE_MB = float(os.getenv("MESSAGE_CACHE_MAX_FILE_MB", "25") or "25")
+# Discord allows 10 files per message; one slot is reserved for the details file.
+MAX_LOG_FILES = 9
 
 AUDIT_ACTION_TITLES = {
     "guild_update": "Изменение настроек сервера",
@@ -317,6 +331,16 @@ def _safe_text(value: Any, limit: int = 450) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _message_text(content: str | None, limit: int = 3800) -> str:
+    """Message content for a log card, keeping line breaks."""
+    if not content:
+        return "(без текста)"
+    text = content.replace("@everyone", "@​everyone").replace(
+        "@here", "@​here"
+    )
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _format_flags(value: disnake.flags.BaseFlags) -> str:
     enabled = [
         FLAG_LABELS.get(name, name.replace("_", " ").capitalize())
@@ -369,7 +393,14 @@ def _build_log_components(
     details: list[str],
     log_key: str,
     application_emojis: dict[str, disnake.Emoji] | None = None,
+    media: list[tuple[str, bool, bool]] | None = None,
 ) -> tuple[list[ui.Component], str | None]:
+    """Build a Components V2 log card.
+
+    ``media`` is a list of ``(filename, is_visual, spoiler)`` for files uploaded
+    together with the card; images/videos are shown in a gallery, other files
+    as file components.
+    """
     emoji_name = LOG_EMOJI_NAMES.get(log_key)
     emoji = application_emojis.get(emoji_name) if application_emojis and emoji_name else None
     icon = f"{emoji} " if emoji is not None else ""
@@ -429,6 +460,20 @@ def _build_log_components(
         components.append(ui.TextDisplay(row))
     if needs_attachment:
         components.append(ui.File(file="attachment://server-log-details.txt"))
+    if media:
+        gallery_items = [
+            disnake.MediaGalleryItem(f"attachment://{name}", spoiler=spoiler)
+            for name, is_visual, spoiler in media
+            if is_visual
+        ]
+        if gallery_items:
+            components.append(
+                ui.Separator(divider=True, spacing=disnake.SeparatorSpacing.small)
+            )
+            components.append(ui.MediaGallery(*gallery_items[:10]))
+        for name, is_visual, spoiler in media:
+            if not is_visual:
+                components.append(ui.File(f"attachment://{name}", spoiler=spoiler))
     components.append(
         ui.Separator(divider=True, spacing=disnake.SeparatorSpacing.small)
     )
@@ -448,10 +493,48 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         self._application_emojis: dict[str, disnake.Emoji] = {}
         self._application_emojis_last_fetch = 0.0
         self._application_emojis_lock = asyncio.Lock()
+        self._message_store: MessageStore | None = None
+        self._message_store_tasks: dict[int, asyncio.Task] = {}
+        # Last seen ``count`` of message deletion audit entries, keyed by
+        # (guild_id, entry_id). Discord increments the count of an existing
+        # entry instead of creating a new one for repeated deletions.
+        self._message_audit_counts: dict[tuple[int, int], int] = {}
+        self._message_audit_locks: dict[int, asyncio.Lock] = {}
 
     async def cog_load(self) -> None:
+        try:
+            self._message_store = MessageStore(MESSAGE_CACHE_DIR)
+        except Exception:
+            logger.exception(
+                "Could not open message store in %s; deleted message content "
+                "and attachments will not be preserved",
+                MESSAGE_CACHE_DIR,
+            )
+        else:
+            self._purge_message_store.start()
         if self.bot.is_ready():
             await self._initialize_audit_baseline()
+
+    def cog_unload(self) -> None:
+        self._purge_message_store.cancel()
+        for task in self._message_store_tasks.values():
+            task.cancel()
+        if self._message_store is not None:
+            self._message_store.close()
+
+    @tasks.loop(hours=1)
+    async def _purge_message_store(self) -> None:
+        if self._message_store is None:
+            return
+        try:
+            removed = await asyncio.to_thread(
+                self._message_store.purge_older_than, MESSAGE_CACHE_DAYS
+            )
+        except Exception:
+            logger.exception("Could not purge old messages from the message store")
+            return
+        if removed:
+            logger.info("Removed %s expired messages from the message store", removed)
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -516,6 +599,10 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         if entry.action in (
             disnake.AuditLogAction.member_move,
             disnake.AuditLogAction.member_disconnect,
+            # Message deletions are reported by the Gateway handlers, which add
+            # the moderator from the audit log to the same card.
+            disnake.AuditLogAction.message_delete,
+            disnake.AuditLogAction.message_bulk_delete,
         ):
             return
 
@@ -667,54 +754,305 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
             log_key="member_leave",
         )
 
+    # --- message storage --------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: disnake.Message) -> None:
+        if (
+            self._message_store is None
+            or message.guild is None
+            or message.author.bot
+            or self._is_log_channel(message.channel.id)
+        ):
+            return
+        message_id = message.id
+        task = asyncio.create_task(self._store_message(message))
+        self._message_store_tasks[message_id] = task
+        task.add_done_callback(
+            lambda _: self._message_store_tasks.pop(message_id, None)
+        )
+
+    async def _store_message(self, message: disnake.Message) -> None:
+        store = self._message_store
+        if store is None or message.guild is None:
+            return
+        attachments = [
+            StoredAttachment(
+                id=attachment.id,
+                filename=attachment.filename,
+                content_type=attachment.content_type,
+                size=attachment.size,
+                url=attachment.url,
+                spoiler=attachment.is_spoiler(),
+            )
+            for attachment in message.attachments
+        ]
+        stored = StoredMessage(
+            message_id=message.id,
+            guild_id=message.guild.id,
+            channel_id=message.channel.id,
+            author_id=message.author.id,
+            author_name=str(message.author),
+            content=message.content or "",
+            created_at=message.created_at.timestamp(),
+            attachments=attachments,
+        )
+        try:
+            await asyncio.to_thread(store.save, stored)
+            if not attachments:
+                return
+            max_bytes = int(MESSAGE_CACHE_MAX_FILE_MB * 1024 * 1024)
+            for source, target in zip(message.attachments, attachments):
+                if source.size > max_bytes:
+                    target.skipped_reason = "слишком большой для сохранения"
+                    continue
+                try:
+                    data = await source.read()
+                except disnake.HTTPException as error:
+                    target.skipped_reason = "не удалось скачать"
+                    logger.warning(
+                        "Could not download attachment %s of message %s: %s",
+                        source.id,
+                        message.id,
+                        error,
+                    )
+                    continue
+                target.path = await asyncio.to_thread(
+                    store.write_attachment, message.id, target, data
+                )
+            await asyncio.to_thread(store.set_attachments, message.id, attachments)
+        except Exception:
+            logger.exception("Could not store message %s", message.id)
+
+    async def _wait_for_stored(self, message_ids: list[int]) -> None:
+        pending = [
+            self._message_store_tasks[message_id]
+            for message_id in message_ids
+            if message_id in self._message_store_tasks
+        ]
+        if pending:
+            await asyncio.wait(pending, timeout=60)
+
+    async def _get_stored_message(self, message_id: int) -> StoredMessage | None:
+        if self._message_store is None:
+            return None
+        await self._wait_for_stored([message_id])
+        try:
+            return await asyncio.to_thread(self._message_store.get, message_id)
+        except Exception:
+            logger.exception("Could not read message %s from the store", message_id)
+            return None
+
+    async def _get_stored_messages(self, message_ids: list[int]) -> list[StoredMessage]:
+        if self._message_store is None:
+            return []
+        await self._wait_for_stored(message_ids)
+        try:
+            return await asyncio.to_thread(self._message_store.get_many, message_ids)
+        except Exception:
+            logger.exception("Could not read deleted messages from the store")
+            return []
+
+    async def _forget_messages(self, message_ids: list[int]) -> None:
+        if self._message_store is None:
+            return
+        try:
+            await asyncio.to_thread(self._message_store.delete, message_ids)
+        except Exception:
+            logger.exception("Could not remove messages from the store")
+
+    @staticmethod
+    def _message_from_cache(message: disnake.Message) -> StoredMessage:
+        return StoredMessage(
+            message_id=message.id,
+            guild_id=message.guild.id if message.guild else 0,
+            channel_id=message.channel.id,
+            author_id=message.author.id,
+            author_name=str(message.author),
+            content=message.content or "",
+            created_at=message.created_at.timestamp(),
+            attachments=[
+                StoredAttachment(
+                    id=attachment.id,
+                    filename=attachment.filename,
+                    content_type=attachment.content_type,
+                    size=attachment.size,
+                    url=attachment.url,
+                    spoiler=attachment.is_spoiler(),
+                )
+                for attachment in message.attachments
+            ],
+        )
+
+    @staticmethod
+    def _format_stored_author(message: StoredMessage) -> str:
+        name = message.author_name.replace("`", "ˋ")
+        return f"<@{message.author_id}> (`{name}` · `{message.author_id}`)"
+
+    async def _prepare_attachment_files(
+        self,
+        guild: disnake.Guild,
+        attachments: list[StoredAttachment],
+        *,
+        max_files: int = MAX_LOG_FILES,
+        prefix: str = "",
+    ) -> tuple[list[disnake.File], list[tuple[str, bool, bool]], set[int]]:
+        """Load stored attachment files so they can be re-uploaded to the log."""
+        files: list[disnake.File] = []
+        media: list[tuple[str, bool, bool]] = []
+        uploaded: set[int] = set()
+        size_limit = guild.filesize_limit
+        for index, attachment in enumerate(attachments, start=1):
+            if len(files) >= max_files:
+                attachment.skipped_reason = (
+                    attachment.skipped_reason or "не поместился в сообщение лога"
+                )
+                continue
+            data = await asyncio.to_thread(MessageStore.read_attachment, attachment)
+            if data is None and attachment.skipped_reason is None and attachment.url:
+                # Last resort: Discord sometimes still serves the file shortly
+                # after the message was deleted.
+                try:
+                    data = await self.bot.http.get_from_cdn(attachment.url)
+                except disnake.HTTPException:
+                    data = None
+            if data is None:
+                attachment.skipped_reason = attachment.skipped_reason or "файл не сохранён"
+                continue
+            if len(data) > size_limit:
+                attachment.skipped_reason = "больше лимита загрузки сервера"
+                continue
+            name = f"{prefix}{index}_{safe_filename(attachment.filename)}"
+            files.append(disnake.File(io.BytesIO(data), filename=name))
+            media.append((name, attachment.is_image, attachment.spoiler))
+            uploaded.add(attachment.id)
+        return files, media, uploaded
+
+    @staticmethod
+    def _attachment_rows(
+        attachments: list[StoredAttachment], uploaded: set[int], title: str
+    ) -> str:
+        lines = []
+        for attachment in attachments:
+            size_kb = max(attachment.size // 1024, 1)
+            line = f"• `{attachment.filename.replace('`', 'ˋ')}` · {size_kb} КБ"
+            if attachment.id in uploaded:
+                line += " · сохранён ниже"
+            elif attachment.skipped_reason:
+                line += f" · {attachment.skipped_reason}"
+            lines.append(line)
+        return f"**{title} ({len(attachments)})**\n" + "\n".join(lines)
+
+    # --- message events ---------------------------------------------------
+
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: disnake.RawMessageUpdateEvent) -> None:
+        data = payload.data
         if (
             payload.guild_id is None
             or self._is_log_channel(payload.channel_id)
-            or "content" not in payload.data
+            or ("content" not in data and "attachments" not in data)
         ):
+            return
+        # Embed unfurls and other system updates do not set edited_timestamp.
+        if "edited_timestamp" in data and not data["edited_timestamp"]:
             return
 
         before = payload.cached_message
-        after_content = payload.data.get("content")
-        author_id = (
-            before.author.id
-            if before is not None
-            else (payload.data.get("author") or {}).get("id")
-        )
-        if before is not None and before.author.bot:
+        author_data = data.get("author") or {}
+        if (before is not None and before.author.bot) or author_data.get("bot"):
             return
-        if before is not None and before.content == after_content:
+
+        stored = await self._get_stored_message(payload.message_id)
+        if stored is None and before is not None:
+            stored = self._message_from_cache(before)
+
+        before_content = stored.content if stored is not None else None
+        after_content = data.get("content", before_content)
+        content_changed = "content" in data and before_content != after_content
+
+        removed: list[StoredAttachment] = []
+        if "attachments" in data and stored is not None:
+            current_ids = {int(item["id"]) for item in data["attachments"]}
+            removed = [a for a in stored.attachments if a.id not in current_ids]
+
+        if not content_changed and not removed:
             return
 
         guild = self.bot.get_guild(payload.guild_id)
         if guild is None:
             return
         channel = self.bot.get_channel(payload.channel_id)
-        author = (
-            before.author
-            if before is not None
-            else f"<@{author_id}> (`{author_id}`)" if author_id else "Не определён"
-        )
-        before_content = before.content if before is not None else "(не было в кэше)"
+        if before is not None:
+            author = _safe_text(before.author)
+        elif stored is not None:
+            author = self._format_stored_author(stored)
+        elif author_data.get("id"):
+            author = f"<@{author_data['id']}> (`{author_data['id']}`)"
+        else:
+            author = "Не определён"
         message_url = (
             f"https://discord.com/channels/{payload.guild_id}/"
             f"{payload.channel_id}/{payload.message_id}"
         )
+
+        details = [
+            f"**Автор** · {author}",
+            f"**Канал** · {_safe_text(channel or f'ID {payload.channel_id}')}",
+        ]
+        if content_changed:
+            details.append(
+                "**Было**\n"
+                + (
+                    _message_text(before_content)
+                    if before_content is not None
+                    else "(не было сохранено)"
+                )
+            )
+            details.append(f"**Стало**\n{_message_text(after_content)}")
+
+        files: list[disnake.File] = []
+        media: list[tuple[str, bool, bool]] = []
+        if removed:
+            files, media, uploaded = await self._prepare_attachment_files(guild, removed)
+            details.append(self._attachment_rows(removed, uploaded, "Удалены вложения"))
+        details.extend(
+            (
+                f"**Ссылка** · [Открыть сообщение]({message_url})",
+                f"**Время** · <t:{int(disnake.utils.utcnow().timestamp())}:F>",
+            )
+        )
         await self._send_log(
             guild,
             "Изменение сообщения",
-            [
-                f"**Автор** · {_safe_text(author or 'Не определён')}",
-                f"**Канал** · {_safe_text(channel or f'ID {payload.channel_id}')}",
-                f"**Было** · {_safe_text(before_content or '(без текста)', 700)}",
-                f"**Стало** · {_safe_text(after_content or '(без текста)', 700)}",
-                f"**Ссылка** · [Открыть сообщение]({message_url})",
-                f"**Время** · <t:{int(disnake.utils.utcnow().timestamp())}:F>",
-            ],
+            details,
             log_key="message_edit",
+            files=files,
+            media=media,
         )
+
+        if self._message_store is not None and stored is not None:
+            try:
+                if content_changed:
+                    await asyncio.to_thread(
+                        self._message_store.update_content,
+                        payload.message_id,
+                        after_content or "",
+                    )
+                if removed:
+                    removed_ids = {a.id for a in removed}
+                    await asyncio.to_thread(
+                        self._message_store.set_attachments,
+                        payload.message_id,
+                        [a for a in stored.attachments if a.id not in removed_ids],
+                    )
+                    await asyncio.to_thread(
+                        self._message_store.remove_attachment_files, removed
+                    )
+            except Exception:
+                logger.exception(
+                    "Could not update stored message %s", payload.message_id
+                )
 
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: disnake.RawMessageDeleteEvent) -> None:
@@ -726,28 +1064,60 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         cached = payload.cached_message
         if cached is not None and cached.author.bot:
             return
-        author = _safe_text(cached.author) if cached is not None else "Не определён"
-        content = (
-            _safe_text(cached.content or "(без текста)", 700)
-            if cached is not None
-            else "Текст не был в кэше"
+
+        stored = await self._get_stored_message(payload.message_id)
+        if stored is None and cached is not None:
+            stored = self._message_from_cache(cached)
+
+        if cached is not None:
+            author = _safe_text(cached.author)
+        elif stored is not None:
+            author = self._format_stored_author(stored)
+        else:
+            author = "Не определён"
+        author_id = stored.author_id if stored is not None else None
+        initiator = await self._find_message_delete_initiator(
+            guild, payload.channel_id, author_id
         )
-        message_url = (
-            f"https://discord.com/channels/{payload.guild_id}/"
-            f"{payload.channel_id}/{payload.message_id}"
+        channel = self.bot.get_channel(payload.channel_id)
+        details = [
+            f"**Автор** · {author}",
+            f"**Канал** · {_safe_text(channel or f'ID {payload.channel_id}')}",
+        ]
+
+        files: list[disnake.File] = []
+        media: list[tuple[str, bool, bool]] = []
+        if stored is None:
+            details.append(
+                "**Сообщение** · Не сохранено: отправлено до запуска бота "
+                "или старше срока хранения"
+            )
+        else:
+            details.append(f"**Сообщение**\n{_message_text(stored.content)}")
+            details.append(f"**Отправлено** · <t:{int(stored.created_at)}:f>")
+            if stored.attachments:
+                files, media, uploaded = await self._prepare_attachment_files(
+                    guild, stored.attachments
+                )
+                details.append(
+                    self._attachment_rows(stored.attachments, uploaded, "Вложения")
+                )
+        details.extend(
+            (
+                f"**Удалил** · {initiator}",
+                f"**ID сообщения** · `{payload.message_id}`",
+                f"**Время** · <t:{int(disnake.utils.utcnow().timestamp())}:F>",
+            )
         )
         await self._send_log(
             guild,
             "Удаление сообщения",
-            [
-                f"**Автор** · {author}",
-                f"**Канал** · {_safe_text(self.bot.get_channel(payload.channel_id) or f'ID {payload.channel_id}')}",
-                f"**Сообщение** · {content}",
-                "**Инициатор** · Не определён по Gateway; аудит может содержать исполнителя",
-                f"**Ссылка** · {message_url}",
-            ],
+            details,
             log_key="message_delete",
+            files=files,
+            media=media,
         )
+        await self._forget_messages([payload.message_id])
 
     @commands.Cog.listener()
     async def on_raw_bulk_message_delete(
@@ -758,17 +1128,84 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         guild = self.bot.get_guild(payload.guild_id)
         if guild is None:
             return
+
+        message_ids = sorted(payload.message_ids)
+        messages = {
+            message.message_id: message
+            for message in await self._get_stored_messages(message_ids)
+        }
+        for cached in payload.cached_messages:
+            if cached.id not in messages and not cached.author.bot:
+                messages[cached.id] = self._message_from_cache(cached)
+        ordered = sorted(messages.values(), key=lambda message: message.created_at)
+
+        channel = self.bot.get_channel(payload.channel_id)
+        details = [
+            f"**Канал** · {_safe_text(channel or f'ID {payload.channel_id}')}",
+            f"**Количество** · {len(message_ids)}",
+            f"**Сохранено** · {len(ordered)} из {len(message_ids)}",
+        ]
+
+        files: list[disnake.File] = []
+        media: list[tuple[str, bool, bool]] = []
+        if ordered:
+            all_attachments = [a for message in ordered for a in message.attachments]
+            # One slot is used by the transcript file.
+            files, media, uploaded = await self._prepare_attachment_files(
+                guild, all_attachments, max_files=MAX_LOG_FILES - 1
+            )
+            transcript_lines = []
+            for message in ordered:
+                sent_at = datetime.datetime.fromtimestamp(message.created_at).strftime(
+                    "%d.%m.%Y %H:%M:%S"
+                )
+                transcript_lines.append(
+                    f"[{sent_at}] {message.author_name} ({message.author_id}):"
+                )
+                transcript_lines.append(message.content or "(без текста)")
+                for attachment in message.attachments:
+                    status = (
+                        "сохранён в логе"
+                        if attachment.id in uploaded
+                        else attachment.skipped_reason or "файл не сохранён"
+                    )
+                    transcript_lines.append(
+                        f"  [вложение] {attachment.filename} "
+                        f"({attachment.size} байт, {status}) {attachment.url}"
+                    )
+                transcript_lines.append("")
+            transcript_name = "deleted-messages.txt"
+            files.insert(
+                0,
+                disnake.File(
+                    io.BytesIO("\n".join(transcript_lines).encode("utf-8")),
+                    filename=transcript_name,
+                ),
+            )
+            media.insert(0, (transcript_name, False, False))
+            details.append(
+                "**Содержимое** · Текст удалённых сообщений приложен файлом "
+                f"`{transcript_name}`"
+            )
+            if all_attachments:
+                details.append(
+                    self._attachment_rows(all_attachments, uploaded, "Вложения")
+                )
+        details.extend(
+            (
+                f"**Удалил** · {await self._find_bulk_delete_initiator(guild, payload.channel_id)}",
+                f"**Время** · <t:{int(disnake.utils.utcnow().timestamp())}:F>",
+            )
+        )
         await self._send_log(
             guild,
             "Массовое удаление сообщений",
-            [
-                f"**Канал** · {_safe_text(self.bot.get_channel(payload.channel_id) or f'ID {payload.channel_id}')}",
-                f"**Количество** · {len(payload.message_ids)}",
-                "**Инициатор** · Не определён по Gateway; аудит может содержать исполнителя",
-                f"**Время** · <t:{int(disnake.utils.utcnow().timestamp())}:F>",
-            ],
+            details,
             log_key="message_bulk_delete",
+            files=files,
+            media=media,
         )
+        await self._forget_messages(message_ids)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -929,7 +1366,7 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         if bot_member is None or not bot_member.guild_permissions.view_audit_log:
             if guild.id not in self._audit_permission_warnings:
                 logger.warning(
-                    "Voice logging cannot identify moderators in guild %s: "
+                    "Audit attribution (voice, message deletions) is unavailable in guild %s: "
                     "the bot is missing VIEW_AUDIT_LOG",
                     guild.id,
                 )
@@ -940,14 +1377,110 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
             return [entry async for entry in guild.audit_logs(limit=50)]
         except disnake.Forbidden:
             logger.warning(
-                "Voice logging could not read audit log for guild %s: Discord returned 403",
+                "Could not read audit log for guild %s: Discord returned 403",
                 guild.id,
             )
         except disnake.HTTPException:
             logger.exception(
-                "Voice logging failed to fetch audit log for guild %s", guild.id
+                "Failed to fetch audit log for guild %s", guild.id
             )
         return None
+
+    async def _find_message_delete_initiator(
+        self, guild: disnake.Guild, channel_id: int, author_id: int | None
+    ) -> str:
+        def match(entries: list[disnake.AuditLogEntry]) -> disnake.AuditLogEntry | None:
+            return self._match_message_delete_entry(
+                guild.id, entries, channel_id, author_id
+            )
+
+        return await self._find_delete_initiator(
+            guild,
+            match,
+            not_found="Сам автор (в журнале аудита нет записи об удалении)",
+        )
+
+    async def _find_bulk_delete_initiator(
+        self, guild: disnake.Guild, channel_id: int
+    ) -> str:
+        def match(entries: list[disnake.AuditLogEntry]) -> disnake.AuditLogEntry | None:
+            now = disnake.utils.utcnow()
+            for entry in entries:
+                key = (guild.id, entry.id)
+                if (
+                    entry.action != disnake.AuditLogAction.message_bulk_delete
+                    or key in self._message_audit_counts
+                    or getattr(entry.target, "id", None) != channel_id
+                    or (now - entry.created_at).total_seconds() > 120
+                ):
+                    continue
+                self._message_audit_counts[key] = 1
+                return entry
+            return None
+
+        return await self._find_delete_initiator(
+            guild, match, not_found="Не определён (в журнале аудита нет записи)"
+        )
+
+    async def _find_delete_initiator(
+        self,
+        guild: disnake.Guild,
+        match: Any,
+        *,
+        not_found: str,
+    ) -> str:
+        bot_member = guild.me
+        if bot_member is None or not bot_member.guild_permissions.view_audit_log:
+            return "Нет доступа к журналу аудита"
+        await self._voice_audit_baseline_ready.wait()
+        lock = self._message_audit_locks.setdefault(guild.id, asyncio.Lock())
+        # Discord writes the audit entry slightly after the Gateway event.
+        for delay in (1.0, 1.5):
+            await asyncio.sleep(delay)
+            async with lock:
+                entries = await self._fetch_voice_audit_entries(guild)
+                if entries is None:
+                    return "Не удалось прочитать журнал аудита"
+                entry = match(entries)
+            if entry is not None:
+                text = _safe_text(entry.user) if entry.user else "Не определён"
+                if entry.reason:
+                    text += f"\n**Причина** · {_safe_text(entry.reason)}"
+                return text
+        return not_found
+
+    def _match_message_delete_entry(
+        self,
+        guild_id: int,
+        entries: list[disnake.AuditLogEntry],
+        channel_id: int,
+        author_id: int | None,
+    ) -> disnake.AuditLogEntry | None:
+        baselined = guild_id in self._voice_audit_baselined
+        now = disnake.utils.utcnow()
+        candidates: list[tuple[disnake.AuditLogEntry, tuple[int, int], int]] = []
+        for entry in entries:
+            if entry.action != disnake.AuditLogAction.message_delete:
+                continue
+            if getattr(getattr(entry.extra, "channel", None), "id", None) != channel_id:
+                continue
+            target_id = getattr(entry.target, "id", None)
+            if author_id is not None and target_id is not None and target_id != author_id:
+                continue
+            count = max(1, int(getattr(entry.extra, "count", 1) or 1))
+            key = (guild_id, entry.id)
+            previous = self._message_audit_counts.get(key)
+            if previous is None:
+                recent = (now - entry.created_at).total_seconds() < 60
+                previous = 0 if baselined or recent else count
+            if count > previous:
+                candidates.append((entry, key, previous))
+        # Without a known author several moderators could match; do not guess.
+        if not candidates or (author_id is None and len(candidates) > 1):
+            return None
+        entry, key, previous = candidates[0]
+        self._message_audit_counts[key] = previous + 1
+        return entry
 
     async def _prime_voice_audit_counts(self, guild: disnake.Guild) -> None:
         entries = await self._fetch_voice_audit_entries(guild)
@@ -955,6 +1488,14 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
             return
         now = disnake.utils.utcnow()
         for entry in entries:
+            if entry.action in (
+                disnake.AuditLogAction.message_delete,
+                disnake.AuditLogAction.message_bulk_delete,
+            ):
+                self._message_audit_counts[(guild.id, entry.id)] = max(
+                    1, int(getattr(entry.extra, "count", 1) or 1)
+                )
+                continue
             if entry.action not in (
                 disnake.AuditLogAction.member_move,
                 disnake.AuditLogAction.member_disconnect,
@@ -1305,10 +1846,11 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         log_key: str,
         context: str,
         files: list[disnake.File] | None = None,
-    ) -> None:
+    ) -> bool:
+        """Send a log card; returns ``False`` if Discord rejected the upload."""
         channel, channel_id = await self._get_log_channel(log_key)
         if channel is None:
-            return
+            return True
         try:
             await channel.send(
                 components=[ui.Container(*components)],
@@ -1323,6 +1865,8 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
             logger.exception(
                 "Failed to send %s for guild %s", context, guild.id
             )
+            return False
+        return True
 
     async def _send_log(
         self,
@@ -1331,29 +1875,45 @@ class ServerLogsCog(commands.Cog, name="Логи сервера"):
         details: list[str],
         *,
         log_key: str = "default",
+        files: list[disnake.File] | None = None,
+        media: list[tuple[str, bool, bool]] | None = None,
     ) -> None:
         emoji_name = LOG_EMOJI_NAMES.get(log_key)
         if emoji_name and emoji_name not in self._application_emojis:
             await self._refresh_application_emojis()
         components, overflow_text = _build_log_components(
-            guild, title, details, log_key, self._application_emojis
+            guild, title, details, log_key, self._application_emojis, media
         )
-        await self._send_components(
+        all_files: list[disnake.File] = []
+        if overflow_text is not None:
+            all_files.append(
+                disnake.File(
+                    io.BytesIO(overflow_text.encode("utf-8")),
+                    filename="server-log-details.txt",
+                )
+            )
+        all_files.extend(files or [])
+        sent = await self._send_components(
             guild,
             components,
             log_key=log_key,
             context=f"server log '{title}'",
-            files=(
-                [
-                    disnake.File(
-                        io.BytesIO(overflow_text.encode("utf-8")),
-                        filename="server-log-details.txt",
-                    )
-                ]
-                if overflow_text is not None
-                else None
-            ),
+            files=all_files or None,
         )
+        if not sent and files:
+            # Most often the attachments together exceed the upload limit:
+            # keep the log itself and drop the files.
+            logger.warning(
+                "Retrying server log '%s' for guild %s without attachments",
+                title,
+                guild.id,
+            )
+            await self._send_log(
+                guild,
+                title,
+                [*details, "**Файлы** · Не удалось загрузить в канал логов"],
+                log_key=log_key,
+            )
 
 
 def setup(bot: commands.Bot) -> None:
